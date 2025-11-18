@@ -3,9 +3,6 @@
 StudyMate — Streamlit app using IBM Granite (via Hugging Face API) + local pipeline fallback,
 FAISS vector store using HuggingFace embeddings, PDF/PPTX/DOCX/image ingestion, quiz generation, etc.
 
-Requirements (suggested):
-    streamlit PyPDF2 python-pptx python-docx easyocr faiss-cpu sentence-transformers transformers huggingface-hub langchain langchain-huggingface pillow requests python-dotenv
-
 Run:
     streamlit run app_granite_streamlit.py
 """
@@ -21,8 +18,21 @@ from io import BytesIO
 
 import streamlit as st
 
-HF_API_KEY = st.secrets["HF_API_KEY"]
+# --- Disable Streamlit usage stats programmatically (extra safety) ---
+os.environ.setdefault("STREAMLIT_GATHER_USAGE_STATS", "false")
+
+# Load environment (.env) if present
 from dotenv import load_dotenv
+load_dotenv()
+
+# Safely read HF token from st.secrets or environment
+HF_API_KEY = None
+try:
+    HF_API_KEY = st.secrets.get("HF_API_KEY") if hasattr(st, "secrets") else None
+except Exception:
+    HF_API_KEY = None
+if not HF_API_KEY:
+    HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_API_KEY") or os.getenv("HUGGINGFACE_API_TOKEN")
 
 # Optional heavy imports - fail gracefully
 try:
@@ -50,53 +60,52 @@ try:
 except Exception:
     Image = None
 
-# LangChain text splitter fallback imports (different versions use different paths)
+# LangChain text splitter - updated import paths with proper exception handling
+RecursiveCharacterTextSplitter = None
 try:
-    # new-ish
-    from langchain.text_splitters import RecursiveCharacterTextSplitter
-except Exception:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
     try:
-        # older package split
-        from langchain_text_splitters import RecursiveCharacterTextSplitter  # your original fallback
-    except Exception:
+        from langchain.text_splitters import RecursiveCharacterTextSplitter  # type: ignore
+    except ImportError:
         RecursiveCharacterTextSplitter = None
 
-# Embeddings and vectorstore
-# Embeddings and vectorstore (robust fallback)
+# Embeddings
+HuggingFaceEmbeddings = None
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
-except:
+except ImportError:
     try:
         from langchain_community.embeddings import HuggingFaceEmbeddings
-    except:
+    except ImportError:
         HuggingFaceEmbeddings = None
 
+# Vector store - updated import paths with proper exception handling
+FAISS = None
 try:
     from langchain_community.vectorstores import FAISS
-except:
+except ImportError:
     try:
-        from langchain.vectorstores import FAISS
-    except:
+        from langchain.vectorstores import FAISS  # type: ignore
+    except ImportError:
         FAISS = None
 
-
-
 # Transformers pipeline (optional local pipeline instead of inference API)
+pipeline = None
 try:
     from transformers import pipeline, logging as hf_logging
     hf_logging.set_verbosity_error()
 except Exception:
     pipeline = None
 
-# Load environment variables
-load_dotenv()
-HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_KEY", "") or os.getenv("HF_API_KEY", "")
+# Config
 HF_MODEL = os.getenv("HF_MODEL", "ibm-granite/granite-3.3-2b-instruct")
-USE_PIPELINE = os.getenv("USE_PIPELINE", "0") in ["1", "true", "True", "yes", "YES"]
+USE_PIPELINE = os.getenv("USE_PIPELINE", "0").lower() in ("1", "true", "yes")
 
-# Streamlit quick guard
-if not HUGGINGFACE_API_TOKEN and not USE_PIPELINE:
-    st.warning("Set HUGGINGFACE_API_KEY in your environment (or set USE_PIPELINE=1 to use a local transformers pipeline).")
+# Informative warning if no token and not using pipeline
+if not HF_API_KEY and not USE_PIPELINE:
+    st.warning("Hugging Face API key not found (set HF_API_KEY in st.secrets or HUGGINGFACE_API_KEY env). "
+               "You can set USE_PIPELINE=1 to attempt a local transformers pipeline if you have the model locally.")
 
 # ---------- Session State ----------
 if 'study_history' not in st.session_state:
@@ -140,21 +149,23 @@ def call_granite(prompt: str, max_new_tokens: int = 256, temperature: float = 0.
         p = get_local_pipeline()
         if p is None:
             raise RuntimeError("USE_PIPELINE requested but local transformers pipeline could not be initialized.")
-        out = p(prompt, max_new_tokens=max_new_tokens, do_sample=True,
-                temperature=temperature, top_p=0.95, num_return_sequences=1)
-        if isinstance(out, list) and len(out) > 0 and 'generated_text' in out[0]:
-            return out[0]['generated_text']
-        # best-effort fallback
-        return " ".join([str(x) for x in out])
+        try:
+            out = p(prompt, max_new_tokens=max_new_tokens, do_sample=True,
+                    temperature=temperature, top_p=0.95, num_return_sequences=1)
+            if isinstance(out, list) and len(out) > 0 and 'generated_text' in out[0]:
+                return out[0]['generated_text']
+            # best-effort fallback
+            return " ".join([str(x) for x in out])
+        except Exception as e:
+            raise RuntimeError(f"Local pipeline failed: {e}")
 
-    # Use Hugging Face Router inference endpoint (NEW)
-    if not HUGGINGFACE_API_TOKEN:
-        raise RuntimeError("HUGGINGFACE_API_TOKEN not set. Set HF_API_KEY in st.secrets or environment.")
+    # Use Hugging Face Router inference endpoint
+    if not HF_API_KEY:
+        raise RuntimeError("Hugging Face API key not set. Place it in st.secrets['HF_API_KEY'] or env HUGGINGFACE_API_KEY.")
 
-    # New router URL (must use /hf-inference/)
     url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
     headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
+        "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -165,18 +176,16 @@ def call_granite(prompt: str, max_new_tokens: int = 256, temperature: float = 0.
             "top_p": 0.95,
             "repetition_penalty": 1.1
         },
-        # router supports the same options structure; keep wait_for_model to True
         "options": {"wait_for_model": True}
     }
 
-    # simple retry (useful for transient HF router errors)
     last_exc = None
     for attempt in range(1, 4):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
-                # tolerant extraction: many models return list/dict or nested
+                # tolerant extraction
                 if isinstance(data, list) and len(data) > 0:
                     first = data[0]
                     if isinstance(first, dict) and "generated_text" in first:
@@ -185,10 +194,9 @@ def call_granite(prompt: str, max_new_tokens: int = 256, temperature: float = 0.
                         return first
                 if isinstance(data, dict) and "generated_text" in data:
                     return data["generated_text"]
-                # some router outputs plain string or different shape — return best-effort
                 if isinstance(data, str):
                     return data
-                # fallback: try to find a 'generated_text' in nested dicts
+                # fallback search
                 def find_generated(obj):
                     if isinstance(obj, dict):
                         if "generated_text" in obj:
@@ -206,33 +214,26 @@ def call_granite(prompt: str, max_new_tokens: int = 256, temperature: float = 0.
                 found = find_generated(data)
                 if found:
                     return found
-                # Last resort: return JSON string
                 return json.dumps(data)
             else:
-                # Helpful error message for common HF responses
                 text = resp.text or resp.reason
                 if resp.status_code == 410:
-                    raise RuntimeError("Hugging Face returned 410: old API endpoint — please ensure you are using the router endpoint.")
+                    raise RuntimeError("Hugging Face returned 410: outdated endpoint — check HF router usage.")
                 if resp.status_code in (401, 403):
-                    raise RuntimeError(f"Hugging Face authentication error {resp.status_code}: check your HF_API_KEY/secret.")
-                # transient 502/503/524 etc -> retry
+                    raise RuntimeError(f"Hugging Face auth error {resp.status_code}: check your key.")
                 if resp.status_code in (502, 503, 504):
                     last_exc = RuntimeError(f"Transient HF router error {resp.status_code}: {text}")
-                    # small backoff
                     import time; time.sleep(1.0 * attempt)
                     continue
-                # otherwise raise with server body
                 raise RuntimeError(f"HuggingFace API error {resp.status_code}: {text}")
         except requests.RequestException as e:
             last_exc = e
             import time; time.sleep(0.6 * attempt)
             continue
 
-    # If we get here, all attempts failed
     if last_exc:
         raise RuntimeError(f"Failed to call Hugging Face Router after retries: {last_exc}")
     raise RuntimeError("Unknown error calling Hugging Face Router.")
-
 
 # ===================== FILE PROCESSING =====================
 def extract_text_from_pdf(pdf_file):
@@ -241,6 +242,7 @@ def extract_text_from_pdf(pdf_file):
         return []
     text_with_pages = []
     try:
+        # pdf_file may be a SpooledTemporaryFile or bytes-like; PyPDF2 accepts file object
         pdf_reader = PdfReader(pdf_file)
     except Exception as e:
         st.error(f"Failed to read PDF: {e}")
@@ -303,12 +305,11 @@ def extract_text_from_image(image_file):
         st.error("Pillow not installed; needed for image OCR.")
         return []
     try:
-        # read bytes and convert to PIL then numpy array for easyocr
         image_bytes = image_file.read()
         pil_img = Image.open(BytesIO(image_bytes)).convert('RGB')
         import numpy as np
         img_arr = np.array(pil_img)
-        reader = easyocr.Reader(['en'], gpu=False)  # adjust gpu if needed
+        reader = easyocr.Reader(['en'], gpu=False)
         result = reader.readtext(img_arr)
         text = " ".join([d[1] for d in result])
         return [{'text': text, 'page': 1, 'source': getattr(image_file, "name", "uploaded_image")}]
@@ -341,7 +342,7 @@ def process_uploaded_files(uploaded_files):
 def extract_knowledge_structure(text_data):
     knowledge = {'concepts': [], 'definitions': [], 'formulas': [], 'key_terms': []}
     for item in text_data:
-        text = item['text']
+        text = item.get('text','')
         definition_patterns = [
             r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:is defined as|refers to|means)\s+([^.]+)',
             r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*):\s+([^.]+)'
@@ -353,8 +354,8 @@ def extract_knowledge_structure(text_data):
                     knowledge['definitions'].append({
                         'term': match.group(1).strip(),
                         'definition': match.group(2).strip(),
-                        'source': item['source'],
-                        'page': item['page']
+                        'source': item.get('source'),
+                        'page': item.get('page')
                     })
             except Exception:
                 continue
@@ -364,8 +365,8 @@ def extract_knowledge_structure(text_data):
             for formula in formulas:
                 knowledge['formulas'].append({
                     'formula': formula.strip(),
-                    'source': item['source'],
-                    'page': item['page']
+                    'source': item.get('source'),
+                    'page': item.get('page')
                 })
         except Exception:
             pass
@@ -382,38 +383,39 @@ def extract_knowledge_structure(text_data):
 def get_text_chunks_with_metadata(text_data):
     if RecursiveCharacterTextSplitter is None:
         st.error("Text splitter not available. Install a compatible langchain/text_splitters package.")
-        return []
+        # fallback: naive paragraph splitting
+        chunks_with_metadata = []
+        for item in text_data:
+            paras = [p.strip() for p in item.get('text','').split('\n\n') if p.strip()]
+            for p in paras:
+                chunks_with_metadata.append({'text': p, 'metadata': {'source': item.get('source'), 'page': item.get('page')}})
+        return chunks_with_metadata
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks_with_metadata = []
     for item in text_data:
         try:
-            chunks = text_splitter.split_text(item['text'])
+            chunks = text_splitter.split_text(item.get('text',''))
         except Exception:
-            # fallback: naive splitter by paragraphs
-            chunks = [p.strip() for p in item['text'].split('\n\n') if p.strip()]
+            chunks = [p.strip() for p in item.get('text','').split('\n\n') if p.strip()]
         for chunk in chunks:
             chunks_with_metadata.append({
                 'text': chunk,
-                'metadata': {'source': item['source'], 'page': item['page']}
+                'metadata': {'source': item.get('source'), 'page': item.get('page')}
             })
     return chunks_with_metadata
 
 def create_vector_store(chunks_with_metadata):
     if not chunks_with_metadata:
         raise ValueError("No text chunks available.")
-    if HuggingFaceEmbeddings is None:
-        st.error("❌ HuggingFaceEmbeddings not available. Install: pip install langchain-huggingface")
-        return None
-
-    if FAISS is None:
-        st.error("❌ FAISS not available. Install: pip install faiss-cpu")
+    if HuggingFaceEmbeddings is None or FAISS is None:
+        st.error("Embeddings or FAISS unavailable. Install required packages.")
         return None
 
     texts = [c['text'] for c in chunks_with_metadata]
     metadatas = [c['metadata'] for c in chunks_with_metadata]
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vector_store = FAISS.from_texts(texts, embedding=embedding_model, metadatas=metadatas)
-    # Save to local dir
     try:
         os.makedirs("faiss_index", exist_ok=True)
         vector_store.save_local("faiss_index")
@@ -437,7 +439,6 @@ def generate_quiz(difficulty="medium", num_questions=5, question_types=None):
         question_types = ["mcq", "true_false", "fill_blank"]
     try:
         vector_store = load_vector_store()
-        knowledge = st.session_state.knowledge_graph
         quiz_questions = []
         all_docs = vector_store.similarity_search("", k=20)
         sampled_docs = random.sample(all_docs, min(num_questions, len(all_docs))) if all_docs else []
@@ -463,7 +464,6 @@ def generate_mcq(context, difficulty, metadata):
     sentences = [s.strip() for s in re.split(r'\.|\n', context) if s.strip()]
     if len(sentences) < 1:
         return None
-    # pick a sentence with reasonable length
     candidate_sentences = [s for s in sentences if len(s.split()) > 6]
     answer_sentence = random.choice(candidate_sentences) if candidate_sentences else sentences[0]
     prompt = (
@@ -473,7 +473,7 @@ def generate_mcq(context, difficulty, metadata):
     )
     try:
         generated = call_granite(prompt, max_new_tokens=180)
-        # Try to parse JSON inside model output (tolerant)
+        # tolerant JSON extraction
         start = generated.find('{'); end = generated.rfind('}') + 1
         if start != -1 and end != -1:
             jtext = generated[start:end]
@@ -493,7 +493,8 @@ def generate_mcq(context, difficulty, metadata):
                     'explanation': f"From source: {metadata.get('source')} (Page {metadata.get('page')})"
                 }
     except Exception as e:
-        st.info(f"MCQ generation via model failed: {e}")
+        st.info(f"MCQ generation via model failed (fallback used): {e}")
+
     # Fallback naive MCQ
     words = [w.strip(".,;:()[]") for w in answer_sentence.split() if len(w) > 3]
     if len(words) < 3:
@@ -544,7 +545,6 @@ def generate_true_false(context, metadata):
             }
     except Exception:
         pass
-    # fallback random
     is_true = random.choice([True, False])
     s = statement
     if not is_true:
@@ -590,11 +590,11 @@ def analyze_quiz_results(quiz_questions, user_answers):
         user_answer = user_answers.get(i)
         correct = False
         if question['type'] == 'mcq':
-            correct = user_answer == question['correct_answer']
+            correct = (user_answer == question['correct_answer'])
         elif question['type'] == 'true_false':
-            correct = user_answer == question['correct_answer']
+            correct = (user_answer == question['correct_answer'])
         elif question['type'] == 'fill_blank':
-            correct = user_answer and user_answer.lower().strip() == question['correct_answer'].lower().strip()
+            correct = (user_answer and str(user_answer).strip().lower() == str(question['correct_answer']).strip().lower())
         if correct:
             score += 1
         else:
@@ -652,96 +652,28 @@ def generate_flashcards():
             'source': formula['source']
         })
     return flashcards
+
 def apply_custom_css():
-    """Apply custom CSS styling"""
     st.markdown("""
     <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        text-align: center;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        padding: 1rem 0;
-    }
-    
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    
-    .metric-value {
-        font-size: 2rem;
-        font-weight: bold;
-    }
-    
-    .metric-label {
-        font-size: 0.9rem;
-        opacity: 0.9;
-    }
-    
-    .stButton>button {
-        width: 100%;
-        border-radius: 20px;
-        font-weight: bold;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        padding: 0.75rem;
-        transition: transform 0.2s;
-    }
-    
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(102,126,234,0.4);
-    }
-    
-    .achievement-badge {
-        display: inline-block;
-        background: #ffd700;
-        color: #333;
-        padding: 0.5rem 1rem;
-        border-radius: 20px;
-        margin: 0.25rem;
-        font-weight: bold;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    }
-    
-    .quiz-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border-left: 4px solid #667eea;
-        margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    
-    .progress-ring {
-        transform: rotate(-90deg);
-    }
-    
-    .sidebar .sidebar-content {
-        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
-    }
+    .main-header { font-size: 2.5rem; font-weight: bold; text-align:center; }
+    .metric-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding:1rem; border-radius:8px; color:white; }
     </style>
     """, unsafe_allow_html=True)
+
 # ===================== Streamlit UI =====================
 def main():
     st.set_page_config(page_title="StudyMate - Granite 3.3 (2B) powered", page_icon="🎓", layout="wide")
-    st.markdown("""
-    <style>
-    .main-header { font-size: 2.2rem; font-weight: bold; text-align:center; }
-    </style>
-    """, unsafe_allow_html=True)
+    apply_custom_css()
     st.markdown('<h1 class="main-header">🎓 StudyMate — Granite 3.3 (2B) Instruct</h1>', unsafe_allow_html=True)
 
     with st.sidebar:
-        st.image("https://img.icons8.com/fluency/96/000000/brain.png", width=80)
+        # Prefer a local asset to avoid remote network calls that can fail in restricted environments
+        asset_path = os.path.join("assets", "brain.png")
+        if os.path.exists(asset_path):
+            st.image(asset_path, width=80)
+        else:
+            st.markdown("### 📚 StudyMate")
         st.title("📚 Navigation")
         page = st.radio("Go to", [
             "🏠 Dashboard", "📤 Upload Materials", "🧠 Knowledge Graph", "📝 Quiz Mode",
@@ -855,8 +787,12 @@ def main():
         if not st.session_state.quiz_results:
             st.info("No quiz data.")
         else:
-            scores = [r['percentage'] for r in st.session_state.quiz_results]
-            st.line_chart(scores)
+            # Guard against empty / invalid data so Vega doesn't get Infinity/empty arrays
+            scores = [r.get('percentage') for r in st.session_state.quiz_results if isinstance(r.get('percentage'), (int, float))]
+            if scores:
+                st.line_chart(scores)
+            else:
+                st.info("No valid score data to chart.")
             st.subheader("Weak Areas")
             if st.session_state.weak_topics:
                 for topic, count in sorted(st.session_state.weak_topics.items(), key=lambda x: x[1], reverse=True):
@@ -906,11 +842,17 @@ def main():
                             f"Context:\n{context}\n\nQuestion: {q}\n\nAnswer:"
                         )
                         with st.spinner("Asking Granite..."):
-                            ans = call_granite(prompt, max_new_tokens=300)
+                            try:
+                                ans = call_granite(prompt, max_new_tokens=300)
+                            except Exception as e:
+                                ans = f"⚠️ Model call failed: {e}"
                             st.success(ans)
                     elif mode == "ELI5":
                         prompt = f"Explain this to a beginner in simple terms: {q}\n\nContext: {context}\n\nAnswer simply:"
-                        ans = call_granite(prompt, max_new_tokens=220, temperature=0.3)
+                        try:
+                            ans = call_granite(prompt, max_new_tokens=220, temperature=0.3)
+                        except Exception as e:
+                            ans = f"⚠️ Model call failed: {e}"
                         st.info(ans)
                     else:
                         st.info("Search results shown above.")
